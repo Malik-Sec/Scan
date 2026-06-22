@@ -1,0 +1,283 @@
+name: Security Scan Pipeline
+
+# ──────────────────────────────────────────────────────────────────────────
+# ⚠️  AVERTISSEMENT LÉGAL
+# Ce workflow exécute des outils de scan ACTIFS (Nikto, OWASP ZAP, SQLMap)
+# qui envoient du trafic d'attaque vers la cible. Ne l'exécute QUE contre
+# des cibles que tu es explicitement autorisé à tester (infra personnelle,
+# mandat de test écrit, programme de bug bounty qui l'autorise).
+# Scanner une cible sans autorisation est illégal dans la plupart des pays.
+# ──────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Cible à auditer (domaine ou IP, sans protocole, ex: example.com)"
+        required: true
+        type: string
+      scan_type:
+        description: "Type de scan à exécuter"
+        required: true
+        type: choice
+        options:
+          - full
+        default: full
+      output_format:
+        description: "Format(s) de sortie du rapport"
+        required: true
+        type: choice
+        options:
+          - markdown+pdf
+          - markdown-only
+        default: markdown+pdf
+      runner:
+        description: "Type de runner pour les jobs de scan"
+        required: true
+        type: choice
+        options:
+          - github-hosted
+          - self-hosted
+        default: github-hosted
+      authorization_confirmed:
+        description: "Je confirme être autorisé à scanner cette cible"
+        required: true
+        type: boolean
+        default: false
+
+env:
+  SCAN_RESULTS_DIR: scan-results
+  REPORT_DIR: report
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────
+  # Garde-fou : bloque le run si la case d'autorisation n'est pas cochée.
+  # ────────────────────────────────────────────────────────────────────
+  guard:
+    name: Vérification préalable
+    runs-on: ubuntu-latest
+    steps:
+      - name: Vérifier la confirmation d'autorisation
+        run: |
+          if [ "${{ inputs.authorization_confirmed }}" != "true" ]; then
+            echo "::error::Tu dois confirmer être autorisé à scanner '${{ inputs.target }}' avant de lancer ce pipeline."
+            exit 1
+          fi
+          echo "Cible : ${{ inputs.target }}"
+          echo "Autorisation confirmée."
+
+  # ────────────────────────────────────────────────────────────────────
+  # 1. Reconnaissance
+  # ────────────────────────────────────────────────────────────────────
+  reconnaissance:
+    name: Reconnaissance
+    needs: guard
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJSON('["self-hosted", "Linux"]') || 'ubuntu-latest' }}
+    outputs:
+      target: ${{ inputs.target }}
+    steps:
+      - name: Préparer le dossier de résultats
+        run: mkdir -p ${{ env.SCAN_RESULTS_DIR }}
+
+      - name: Installer les dépendances de recon
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y nmap whois dnsutils
+          # subfinder (binaire Go précompilé)
+          curl -sL https://github.com/projectdiscovery/subfinder/releases/latest/download/subfinder_linux_amd64.zip -o subfinder.zip
+          unzip -o subfinder.zip -d /usr/local/bin/ subfinder || true
+          chmod +x /usr/local/bin/subfinder || true
+
+      - name: Nmap -sV -sC
+        continue-on-error: true
+        run: |
+          nmap -sV -sC -oX ${{ env.SCAN_RESULTS_DIR }}/nmap.xml "${{ inputs.target }}"
+
+      - name: Whois + DNS
+        continue-on-error: true
+        run: |
+          whois "${{ inputs.target }}" > ${{ env.SCAN_RESULTS_DIR }}/whois.txt || true
+          dig "${{ inputs.target }}" ANY +noall +answer > ${{ env.SCAN_RESULTS_DIR }}/dns.txt || true
+
+      - name: Subfinder
+        continue-on-error: true
+        run: |
+          subfinder -d "${{ inputs.target }}" -o ${{ env.SCAN_RESULTS_DIR }}/subfinder.txt -silent || true
+
+      - name: Shodan API
+        continue-on-error: true
+        env:
+          SHODAN_API_KEY: ${{ secrets.SHODAN_API_KEY }}
+        run: |
+          if [ -z "$SHODAN_API_KEY" ]; then
+            echo "SHODAN_API_KEY non configurée — étape ignorée. Ajoute-la dans Settings > Secrets si tu veux ce module."
+            echo "{}" > ${{ env.SCAN_RESULTS_DIR }}/shodan.json
+          else
+            pip install --quiet shodan
+            shodan host "${{ inputs.target }}" --format json > ${{ env.SCAN_RESULTS_DIR }}/shodan.json || echo "{}" > ${{ env.SCAN_RESULTS_DIR }}/shodan.json
+          fi
+
+      - name: Upload résultats recon
+        uses: actions/upload-artifact@v4
+        with:
+          name: recon-results
+          path: ${{ env.SCAN_RESULTS_DIR }}/
+          retention-days: 1
+
+  # ────────────────────────────────────────────────────────────────────
+  # 2. Scan de vulnérabilités
+  # ────────────────────────────────────────────────────────────────────
+  vulnerability-scan:
+    name: Scan de vulnérabilités
+    needs: reconnaissance
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJSON('["self-hosted", "Linux"]') || 'ubuntu-latest' }}
+    steps:
+      - name: Télécharger résultats recon
+        uses: actions/download-artifact@v4
+        with:
+          name: recon-results
+          path: ${{ env.SCAN_RESULTS_DIR }}/
+
+      - name: Nikto (web)
+        continue-on-error: true
+        run: |
+          docker run --rm -v "$PWD/${{ env.SCAN_RESULTS_DIR }}:/output" sullo/nikto \
+            -h "${{ inputs.target }}" -Format json -output /output/nikto.json || true
+
+      - name: OWASP ZAP baseline
+        continue-on-error: true
+        run: |
+          docker run --rm -v "$PWD/${{ env.SCAN_RESULTS_DIR }}:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+            -t "https://${{ inputs.target }}" -J zap.json -I || true
+
+      - name: Trivy (CVE)
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: "config"
+          scan-ref: "."
+          format: "json"
+          output: "${{ env.SCAN_RESULTS_DIR }}/trivy.json"
+
+      - name: SQLMap
+        continue-on-error: true
+        run: |
+          pip install --quiet sqlmap
+          sqlmap -u "https://${{ inputs.target }}" --batch --crawl=1 \
+            --output-dir="${{ env.SCAN_RESULTS_DIR }}/sqlmap_raw" 2>&1 \
+            | tee ${{ env.SCAN_RESULTS_DIR }}/sqlmap.log || true
+
+      - name: Upload résultats vuln scan
+        uses: actions/upload-artifact@v4
+        with:
+          name: vuln-results
+          path: ${{ env.SCAN_RESULTS_DIR }}/
+          retention-days: 1
+
+  # ────────────────────────────────────────────────────────────────────
+  # 3. Agrégation (script Python)
+  # ────────────────────────────────────────────────────────────────────
+  aggregate:
+    name: Agrégation des résultats
+    needs: vulnerability-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Télécharger résultats vuln scan
+        uses: actions/download-artifact@v4
+        with:
+          name: vuln-results
+          path: ${{ env.SCAN_RESULTS_DIR }}/
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Lancer l'agrégation
+        run: |
+          mkdir -p ${{ env.REPORT_DIR }}
+          python3 scripts/aggregate.py \
+            --input-dir ${{ env.SCAN_RESULTS_DIR }} \
+            --output-dir ${{ env.REPORT_DIR }} \
+            --target "${{ inputs.target }}" \
+            --scan-type "${{ inputs.scan_type }}"
+        # Le script peut sortir avec un code != 0 si critical/high trouvés.
+        # On continue le pipeline quand même pour générer le rapport,
+        # mais on garde la trace du résultat pour le résumé final.
+        continue-on-error: true
+        id: aggregate_step
+
+      - name: Upload rapport agrégé (md/json/sarif)
+        uses: actions/upload-artifact@v4
+        with:
+          name: aggregated-report
+          path: ${{ env.REPORT_DIR }}/
+          retention-days: 1
+
+      - name: Statut agrégation
+        run: |
+          if [ "${{ steps.aggregate_step.outcome }}" == "failure" ]; then
+            echo "::warning::Des vulnérabilités critiques ou hautes ont été détectées. Voir le rapport."
+          fi
+
+  # ────────────────────────────────────────────────────────────────────
+  # 4. Génération du rapport (Markdown → Pandoc → PDF)
+  # ────────────────────────────────────────────────────────────────────
+  generate-report:
+    name: Génération du rapport
+    needs: aggregate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Télécharger rapport agrégé
+        uses: actions/download-artifact@v4
+        with:
+          name: aggregated-report
+          path: ${{ env.REPORT_DIR }}/
+
+      - name: Installer Pandoc + moteur PDF
+        if: ${{ inputs.output_format == 'markdown+pdf' }}
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y pandoc wkhtmltopdf
+
+      - name: Générer report.pdf
+        if: ${{ inputs.output_format == 'markdown+pdf' }}
+        run: |
+          pandoc ${{ env.REPORT_DIR }}/report.md \
+            --pdf-engine=wkhtmltopdf \
+            -o ${{ env.REPORT_DIR }}/report.pdf \
+            --metadata title="Rapport de sécurité — ${{ inputs.target }}"
+
+      - name: Calculer le hash SHA256 du rapport
+        run: |
+          cd ${{ env.REPORT_DIR }}
+          sha256sum report.md > report.md.sha256
+          if [ -f report.pdf ]; then sha256sum report.pdf > report.pdf.sha256; fi
+          cat *.sha256
+
+      - name: Upload artifact final (GitHub Artifact, 30 jours)
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report-${{ inputs.target }}
+          path: |
+            ${{ env.REPORT_DIR }}/report.md
+            ${{ env.REPORT_DIR }}/report.pdf
+            ${{ env.REPORT_DIR }}/report.json
+            ${{ env.REPORT_DIR }}/*.sha256
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload SARIF au tab Security
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: ${{ env.REPORT_DIR }}/report.sarif
+
+      - name: Résumé dans le job summary
+        run: |
+          echo "## 🛡️ Rapport de sécurité — ${{ inputs.target }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          cat ${{ env.REPORT_DIR }}/report.md >> $GITHUB_STEP_SUMMARY
